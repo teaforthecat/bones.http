@@ -20,14 +20,6 @@
    :command
    {:args {s/Keyword s/Any}}))
 
-;; todo register multiple query handlers
-;; remove?
-;; this gets redefined in `register-query-handler'
-(s/defschema Query
-  {:q s/Any
-   (s/optional-key :type) s/Str
-   s/Keyword s/Any})
-
 ;; a default is not needed due to the `check-command-exists' interceptor
 (defmulti command :command)
 
@@ -74,15 +66,6 @@
 
 (defn register-commands [commands]
   (map (partial apply register-command) commands))
-
-(defn register-query-handler [explicit-handler schema]
-  (let [user-query-handler (resolve-command explicit-handler)]
-    (if (nil? user-query-handler)
-      (throw (ex-info "could not resolve query to a function" {:query explicit-handler})))
-    ;; todo register multiple query handlers
-    (s/defschema Query schema)
-    (defn query [query-params req]
-      (user-query-handler query-params req))))
 
 ;; remove?
 (defn echo "built-in sanity check" [args req] args)
@@ -131,16 +114,6 @@
           (throw (ex-info "Invalid Credentials" {:status 400}))))
       (throw (ex-info "Invalid Command" {:status 400}))))
 
-;; todo register multiple query handlers somehow
-;; remove?
-;; this gets overwritten by `register-query-handler'
-(defn query [params req]
-  (let [q (:q params)]
-    {:results (edn/read-string q)}))
-
-(defn query-handler [req]
-  (query (:query-params req) req))
-
 (defn identity-interceptor [shield]
   ;; sets request :identity to data of decrypted "Token" in the "Authorization" header
   ;; sets request :identity to data of :identity in session cookie
@@ -172,10 +145,10 @@
                            (throw (ex-info "args not valid" (assoc error :status 400)))
                            ctx))}))
 
-(def check-query-params-spec
+(defn check-query-params-spec [spec]
   (interceptor {:name :bones/check-query-params-spec
                 :enter (fn [ctx]
-                         (if-let [error (s/check Query (get-in ctx [:request :query-params] {}))]
+                         (if-let [error (s/check spec (get-in ctx [:request :query-params] {}))]
                            (throw (ex-info "query params not valid" (assoc error :status 400)))
                            ctx))}))
 
@@ -196,17 +169,10 @@
   [ctx]
   (update-in ctx [:response] #(respond-with % "application/edn")))
 
-;; (defmethod render "text/event-stream"
-;;   [ctx]
-;;   (if (ms/source? (:response ctx))
-;;     (let [stream-ready-fn #((ms/connect (:response ctx)
-;;                                         (:response-channel ctx)))]
-;;       (sse/start-stream stream-ready-fn context heartbeat-delay bufferfn-or-n opts))
-;;     (throw (ex-info "source not given for text/event-stream" {:status 500}))))
-
 (def renderer
   (interceptor {:name :bones/renderer
-                :leave (fn [ctx] (render ctx))}))
+                :leave (fn [ctx]
+                         (render ctx))}))
 
 (def body-params
   "shim for the body-params interceptor, stuff the result into a single
@@ -220,21 +186,22 @@
                                                                     (:json-params req)
                                                                     (:transit-params req)
                                                                     (:form-params req))))))}))
+(defn error-parser [ctx ex]
+  (let [exception (-> ex ex-data :exception) ;; nested exception
+        data (ex-data exception)
+        status (or (:status data) 500)
+        resp {:message (.getMessage exception)}
+        response (if (empty? (dissoc data :status))
+                   resp
+                   (assoc resp :data (dissoc data :status)))]
+    (-> (assoc ctx :response response) ;; sets body
+        (render) ;; sets content-type
+        (update :response assoc :status status))))
 
 (def error-responder
   ;; get status of the nested(thrown) exception's ex-data for specialized http responses
   (interceptor {:name :bones/error-responder
-                :error (fn [ctx ex]
-                         (let [exception (-> ex ex-data :exception) ;; nested exception
-                               data (ex-data exception)
-                               status (or (:status data) 500)
-                               resp {:message (.getMessage exception)}
-                               response (if (empty? (dissoc data :status))
-                                          resp
-                                          (assoc resp :data (dissoc data :status)))]
-                           (-> (assoc ctx :response response) ;; sets body
-                               (render) ;; sets content-type
-                               (update :response assoc :status status))))}))
+                :error error-parser}))
 
 (defn get-resource-interceptors []
   ^:interceptors
@@ -283,7 +250,15 @@
                    ]
    'bones.http.handlers/login-handler])
 
-(defn query-resource [conf shield]
+(defn query-interceptor [query-handler]
+  (interceptor {:name :bones/query
+                :enter (fn [ctx]
+                         (let [{:keys [request]} ctx
+                               {:keys [query-params]} request]
+                           (assoc ctx :response
+                                  (query-handler query-params request))))}))
+
+(defn query-resource [conf shield query-handler query-schema]
   ;; need to use namespace so this can be called from a macro (defroutes)
   [:bones/query
    ^:interceptors ['bones.http.handlers/error-responder              ; request ; must come first
@@ -291,10 +266,11 @@
                    (bones.http.handlers/session shield)              ; auth
                    (bones.http.handlers/identity-interceptor shield) ; auth
                    'bones.http.auth/check-authenticated              ; auth
-                   'bones.http.handlers/check-query-params-spec      ; query
+                   (bones.http.handlers/check-query-params-spec query-schema)      ; query
                    'bones.http.handlers/renderer                     ; response
                    ]
-   'bones.http.handlers/query-handler])
+   ;; 'bones.http.handlers/query-handler
+   (query-interceptor query-handler)])
 
 (defn event-stream-resource [conf shield event-stream-handler]
   ;; need to use namespace so this can be called from a macro (defroutes)
@@ -303,8 +279,7 @@
                    (cn/negotiate-content ["text/event-stream"])      ; request
                    (bones.http.handlers/session shield)              ; auth
                    (bones.http.handlers/identity-interceptor shield) ; auth
-                   'bones.http.auth/check-authenticated              ; auth
-                   ]
+                   'bones.http.auth/check-authenticated]              ; auth
    (sse/start-event-stream event-stream-handler)])
 
 (defrecord CQRS [conf shield]
@@ -319,8 +294,11 @@
                      ["/command"
                       {:post (command-resource config auth-sheild)
                        :get (command-list-resource config auth-sheild)}]
-                     ["/query"
-                      {:get (query-resource config auth-sheild)}]
+                     (if (:query-handler config)
+                       (let [query-handler (:query-handler config)
+                             query-schema (:query-schema config)]
+                         ["/query"
+                          {:get (query-resource config auth-sheild query-handler query-schema)}]))
                      (if-let [event-stream-handler (:event-stream-handler config)]
                        ["/events"
                         {:get (event-stream-resource config

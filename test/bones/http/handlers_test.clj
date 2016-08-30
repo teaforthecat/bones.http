@@ -19,9 +19,18 @@
                          :id 1})
   (a/close! event-channel))
 
+;; pretend query handler
+(defn graph [params req]
+  (let [g (-> params :q edn/read-string)]
+    {:graph g}))
+
+(def graph-spec {:q s/Str})
+
 (def conf {:http/auth {:secret  (apply str (map char (range 32)))
                        :cookie-name "pizza"}
-           :http/handlers {:event-stream-handler test-events}})
+           :http/handlers {:event-stream-handler test-events
+                           :query-handler graph
+                           :query-schema graph-spec}})
 (def shield (.start (auth/map->Shield {:conf conf})))
 (def cqrs (.start (handlers/map->CQRS {:shield shield
                                        :conf conf})))
@@ -190,13 +199,6 @@
       (is (= "application/edn" (get (:headers response) "Content-Type")))
       (is (= 200 (:status response))))))
 
-;; pretend query handler
-(defn graph [params req]
-  (let [g (-> params :q edn/read-string)]
-    {:graph g}))
-
-(handlers/register-query-handler :graph {:q s/Str} )
-
 (deftest query-resource-test
   ;; given the registered query handler above
   (testing "a valid token or session is required"
@@ -227,9 +229,9 @@
         (is (= 200 (:status response)))))))
 
 (deftest event-stream-test
-  (testing "a stream is started"
-    (let [response (http-get "/api/events" (merge valid-token
-                                                  {"Content-Type" "text/event-stream"}))
+  (testing "sends data from a core/async put!"
+    ;; doesn't require a Content-Type header
+    (let [response (http-get "/api/events" valid-token)
           rn "\r\n"]
       (is (= (str
               "event: greetings" rn

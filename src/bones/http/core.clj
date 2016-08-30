@@ -20,4 +20,3 @@
 
 (def register-command #'handlers/register-command)
 (def register-commands #'handlers/register-commands)
-(def register-query-handler #'handlers/register-query-handler)
